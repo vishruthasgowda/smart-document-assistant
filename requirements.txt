@@ -9,3 +9,6 @@ pypdf
 python-docx
 python-dotenv
 sentence-transformers
+pytesseract
+pdf2image
+Pillow

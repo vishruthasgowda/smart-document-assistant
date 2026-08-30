@@ -12,7 +12,7 @@ from docx import Document
 load_dotenv()
 
 st.set_page_config(
-    page_title="DocuMind AI - Smart Document Assistant", page_icon="⚡", layout="wide"
+    page_title="DocuBrain AI - Smart Document Assistant", page_icon="🧠", layout="wide"
 )
 
 # ============================================================
@@ -206,6 +206,13 @@ def check_firebase_redirect_login():
 
 
 def extract_text_from_file(uploaded_file):
+    """
+    Extracts text from PDF, DOCX, or TXT files as robustly as possible.
+    Returns (text, warning_message). warning_message is None on a clean
+    extraction, or a short note (e.g. "used OCR") if a fallback was used.
+    Raises a ValueError with a clear, user-facing message only if every
+    method genuinely fails to get any text out of the file.
+    """
     file_extension = uploaded_file.name.split(".")[-1].lower()
     temp_file_path = f"temp_{uploaded_file.name}"
 
@@ -213,23 +220,94 @@ def extract_text_from_file(uploaded_file):
         f.write(uploaded_file.getbuffer())
 
     text = ""
+    warning = None
+
     try:
         if file_extension == "pdf":
-            reader = PdfReader(temp_file_path)
-            for page in reader.pages:
-                text += page.extract_text() or ""
+            text = _extract_pdf_text(temp_file_path)
+            if not text.strip():
+                # Likely a scanned/image-only PDF — fall back to OCR.
+                text = _extract_pdf_text_via_ocr(temp_file_path)
+                if text.strip():
+                    warning = "This looked like a scanned PDF, so text was extracted using OCR (image-to-text). Accuracy may vary depending on scan quality."
+
         elif file_extension == "txt":
-            loader = TextLoader(temp_file_path)
-            docs = loader.load()
-            text = "\n".join([doc.page_content for doc in docs])
+            text = _extract_txt_text(temp_file_path)
+
         elif file_extension == "docx":
-            doc = Document(temp_file_path)
-            text = "\n".join([para.text for para in doc.paragraphs])
+            text = _extract_docx_text(temp_file_path)
+
+        else:
+            raise ValueError(f"Unsupported file type: .{file_extension}")
+
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
+    if not text.strip():
+        raise ValueError(
+            "No readable text could be found in this file, even after trying OCR. "
+            "It may be empty, corrupted, or password-protected."
+        )
+
+    return text, warning
+
+
+def _extract_pdf_text(path):
+    """Try normal text-layer extraction first (fast, works for digital PDFs)."""
+    text = ""
+    try:
+        reader = PdfReader(path)
+        for page in reader.pages:
+            text += (page.extract_text() or "") + "\n"
+    except Exception:
+        text = ""
     return text
+
+
+def _extract_pdf_text_via_ocr(path):
+    """Fallback for scanned/image-based PDFs: render pages to images and OCR them."""
+    text = ""
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+
+        pages = convert_from_path(path)
+        for page_image in pages:
+            text += pytesseract.image_to_string(page_image) + "\n"
+    except Exception:
+        # OCR tools (poppler/tesseract) may not be installed in this
+        # environment — fail quietly and let the caller report "no text found".
+        text = ""
+    return text
+
+
+def _extract_txt_text(path):
+    """Try a list of common encodings so odd/legacy .txt files still load."""
+    encodings_to_try = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+    for encoding in encodings_to_try:
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    # Last resort: read as bytes and ignore undecodable characters.
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", errors="ignore")
+
+
+def _extract_docx_text(path):
+    """Extract paragraphs AND table cell text from a .docx file."""
+    doc = Document(path)
+    parts = [para.text for para in doc.paragraphs if para.text.strip()]
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+
+    return "\n".join(parts)
 
 
 def format_docs(docs):
@@ -240,7 +318,7 @@ def format_docs(docs):
 def render_navbar(unique_prefix=""):
     col_logo, col_space, c1, c2, c3 = st.columns([2, 2, 1, 1, 1])
     with col_logo:
-        st.markdown("<p class='logo-container'>⚡ DOCUMIND AI</p>", unsafe_allow_html=True)
+        st.markdown("<p class='logo-container'>🧠 DOCUBRAIN AI</p>", unsafe_allow_html=True)
     with c1:
         if st.button("HOME", key=f"{unique_prefix}_home", use_container_width=True):
             st.session_state.page = "home"
@@ -288,8 +366,8 @@ def show_landing_page():
 # --- About Us Page ---
 def show_about_page():
     render_navbar(unique_prefix="nav_about")
-    st.markdown("## About DocuMind AI")
-    st.write("DocuMind AI is an enterprise-grade semantic parsing engine designed to extract, index, and reason across large volumes of textual files securely.")
+    st.markdown("## About DocuBrain AI")
+    st.write("DocuBrain AI is an enterprise-grade semantic parsing engine designed to extract, index, and reason across large volumes of textual files securely.")
     st.markdown("### Core Capabilities")
     st.markdown("* **High-Speed Embeddings:** Powered by HuggingFace and FAISS vector structures.")
     st.markdown("* **Secure Auth Workspaces:** Isolated memory mapping for private user sessions.")
@@ -436,36 +514,59 @@ def show_workspace():
         if "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
             with st.status("Processing document into vector memory...", expanded=True) as status:
                 st.write("Extracting file text payload...")
-                raw_text = extract_text_from_file(uploaded_file)
-
-                if not raw_text.strip():
-                    st.error("Could not extract text from this file.")
+                try:
+                    raw_text, extraction_warning = extract_text_from_file(uploaded_file)
+                except ValueError as e:
+                    status.update(label="Could not process this file", state="error", expanded=True)
+                    st.error(str(e))
+                    return
+                except Exception as e:
+                    status.update(label="Unexpected error while reading the file", state="error", expanded=True)
+                    st.error(f"Something went wrong reading this file: {e}")
                     return
 
-                st.write("Splitting text chunks...")
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                chunks = text_splitter.split_text(raw_text)
+                if extraction_warning:
+                    st.warning(extraction_warning)
 
-                st.write("Generating local embeddings & vector index...")
-                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-                vector_store = FAISS.from_texts(chunks, embeddings)
+                try:
+                    st.write("Splitting text chunks...")
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                    chunks = text_splitter.split_text(raw_text)
 
-                # Groq's llama-3.3-70b-versatile (and llama-3.1-8b-instant) were
-                # deprecated in June 2026. openai/gpt-oss-20b / openai/gpt-oss-120b
-                # are the current recommended replacements.
-                llm = ChatGroq(
-                    temperature=0.2,
-                    model_name="openai/gpt-oss-20b"
-                )
-                retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+                    if not chunks:
+                        status.update(label="Could not process this file", state="error", expanded=True)
+                        st.error("This document didn't contain enough text to work with after processing. Try a different file.")
+                        return
 
-                st.session_state.retriever = retriever
-                st.session_state.llm = llm
-                st.session_state.vector_store = vector_store
-                st.session_state.current_file = uploaded_file.name
-                st.session_state.chat_history = []
+                    st.write("Generating local embeddings & vector index...")
+                    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+                    vector_store = FAISS.from_texts(chunks, embeddings)
 
-                status.update(label="Document indexed successfully!", state="complete", expanded=False)
+                    # Groq's llama-3.3-70b-versatile (and llama-3.1-8b-instant) were
+                    # deprecated in June 2026. openai/gpt-oss-20b / openai/gpt-oss-120b
+                    # are the current recommended replacements.
+                    llm = ChatGroq(
+                        temperature=0.2,
+                        model_name="openai/gpt-oss-20b"
+                    )
+                    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
+                    st.session_state.retriever = retriever
+                    st.session_state.llm = llm
+                    st.session_state.vector_store = vector_store
+                    st.session_state.current_file = uploaded_file.name
+                    st.session_state.chat_history = []
+
+                    status.update(label="Document indexed successfully!", state="complete", expanded=False)
+
+                except Exception as e:
+                    status.update(label="Something went wrong while indexing this document", state="error", expanded=True)
+                    st.error(
+                        "This document could not be indexed. This is usually a temporary issue "
+                        "(e.g. embedding model download or API connection) rather than a problem with your file. "
+                        f"Details: {e}"
+                    )
+                    return
 
     if "vector_store" in st.session_state:
         header_col, download_col = st.columns([4, 1])
@@ -478,7 +579,7 @@ def show_workspace():
         with download_col:
             if st.session_state.chat_history:
                 chat_text_lines = [
-                    f"DocuMind AI - Chat Export",
+                    f"DocuBrain AI - Chat Export",
                     f"Document: {st.session_state.get('current_file', 'N/A')}",
                     f"User: {st.session_state.user_email}",
                     "=" * 40,
@@ -502,12 +603,13 @@ def show_workspace():
 
         if user_query:
             with st.spinner("Synthesizing answer..."):
-                retrieved_docs = st.session_state.retriever.invoke(user_query)
-                context_text = format_docs(retrieved_docs)
+                try:
+                    retrieved_docs = st.session_state.retriever.invoke(user_query)
+                    context_text = format_docs(retrieved_docs)
 
-                history_str = "\n".join([f"{role}: {msg}" for role, msg in st.session_state.chat_history])
+                    history_str = "\n".join([f"{role}: {msg}" for role, msg in st.session_state.chat_history])
 
-                formatted_prompt = f"""Answer the question accurately based only on the following context retrieved from the document:
+                    formatted_prompt = f"""Answer the question accurately based only on the following context retrieved from the document:
 {context_text}
 
 Chat History:
@@ -515,10 +617,16 @@ Chat History:
 
 Question: {user_query}
 """
-                answer = st.session_state.llm.invoke(formatted_prompt).content
+                    answer = st.session_state.llm.invoke(formatted_prompt).content
 
-                st.session_state.chat_history.append(("User", user_query))
-                st.session_state.chat_history.append(("Assistant", answer))
+                    st.session_state.chat_history.append(("User", user_query))
+                    st.session_state.chat_history.append(("Assistant", answer))
+
+                except Exception as e:
+                    st.error(
+                        "Couldn't get an answer just now — this is usually a temporary connection or "
+                        f"rate-limit issue with the AI service, not a problem with your document. Details: {e}"
+                    )
 
         for role, msg in st.session_state.chat_history:
             with st.chat_message("user" if role == "User" else "assistant"):
